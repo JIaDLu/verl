@@ -31,7 +31,7 @@
 #   2. Reward vLLM is running:
 #        bash examples/grpo_trainer/start_reward_vllm.sh
 #      Verify: curl http://127.0.0.1:8000/v1/models
-#   3. OPENAI_API_KEY is exported (used by User Simulator + Judges).
+#   3. DEEPSEEK_API_KEY is exported (used by User Simulator + Judges).
 #   4. wandb is logged in.
 #
 # Launch:
@@ -54,8 +54,9 @@ WANDB_ENTITY=${WANDB_ENTITY:-lujiadong-nus}
 # ---------- reward-side endpoints ----------
 REWARD_POLICY_BASE=${REWARD_POLICY_BASE:-http://127.0.0.1:8000/v1}
 REWARD_POLICY_NAME=${REWARD_POLICY_NAME:-collabllm-policy}
-LLM_API_BASE=${LLM_API_BASE:-https://api.openai.com/v1}
-LLM_MODEL=${LLM_MODEL:-gpt-5.2}
+LLM_API_BASE=${LLM_API_BASE:-https://api.deepseek.com/v1}
+LLM_API_KEY_ENV=${LLM_API_KEY_ENV:-DEEPSEEK_API_KEY}
+LLM_MODEL=${LLM_MODEL:-deepseek-v4-pro}
 
 # Sanity check: reward vLLM up?
 if ! curl -sf "${REWARD_POLICY_BASE/\/v1/}/v1/models" > /dev/null 2>&1; then
@@ -63,8 +64,8 @@ if ! curl -sf "${REWARD_POLICY_BASE/\/v1/}/v1/models" > /dev/null 2>&1; then
     echo "Start it first: bash examples/grpo_trainer/start_reward_vllm.sh"
     exit 1
 fi
-if [ -z "${OPENAI_API_KEY:-}" ]; then
-    echo "ERROR: OPENAI_API_KEY env var is empty. Export it before launching."
+if [ -z "${!LLM_API_KEY_ENV:-}" ]; then
+    echo "ERROR: ${LLM_API_KEY_ENV} env var is empty. Export it before launching."
     exit 1
 fi
 
@@ -126,7 +127,7 @@ python -m verl.trainer.main_ppo \
     +reward.reward_kwargs.max_seq_len=4096 \
     +reward.reward_kwargs.token_amount_clip_k=4.0 \
     +reward.reward_kwargs.llm_api_base="${LLM_API_BASE}" \
-    +reward.reward_kwargs.llm_api_key_env=OPENAI_API_KEY \
+    +reward.reward_kwargs.llm_api_key_env="${LLM_API_KEY_ENV}" \
     +reward.reward_kwargs.llm_model="${LLM_MODEL}" \
     +reward.reward_kwargs.user_simulator_temperature=0.8 \
     +reward.reward_kwargs.judge_temperature=0.0 \

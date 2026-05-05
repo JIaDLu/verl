@@ -43,9 +43,11 @@ class CollabLLMConfig:
     tiktoken_encoding: str = "cl100k_base"    # offline token counter
 
     # ---------- LLM API for User Simulator + Judges ----------
-    llm_api_base: str = "https://api.openai.com/v1"
-    llm_api_key_env: str = "OPENAI_API_KEY"   # name of env var holding the key
-    llm_model: str = "gpt-5.2"
+    # Defaults target DeepSeek-v4-pro via its OpenAI-compatible endpoint;
+    # override via reward_kwargs to switch providers.
+    llm_api_base: str = "https://api.deepseek.com/v1"
+    llm_api_key_env: str = "DEEPSEEK_API_KEY"   # name of env var holding the key
+    llm_model: str = "deepseek-v4-pro"
     user_simulator_temperature: float = 0.8
     user_simulator_max_tokens: int = 512
     judge_temperature: float = 0.0
@@ -72,6 +74,11 @@ class CollabLLMConfig:
     # ---------- Defaults on parse/network failure ----------
     accuracy_default: float = 0.0
     interactivity_default: float = 0.0
+
+    # ---------- Tracing (debug / audit) ----------
+    # If set, every LLM call (User Sim / Judges / Policy) appends one
+    # JSONL line to this file. Disabled in production by default.
+    trace_path: str | None = None
 
     def __post_init__(self) -> None:
         if len(self.metric_names) != len(self.metric_weights):

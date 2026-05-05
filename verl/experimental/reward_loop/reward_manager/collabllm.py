@@ -103,6 +103,7 @@ class CollabLLMRewardManager(RewardManagerBase):
             base_url=cfg.llm_api_base,
             api_key=api_key,
             request_timeout=cfg.api_request_timeout,
+            trace_path=cfg.trace_path,
         )
         cls._judge_client = cls._sim_client
 
@@ -110,6 +111,7 @@ class CollabLLMRewardManager(RewardManagerBase):
             base_url=cfg.policy_api_base,
             api_key=cfg.policy_api_key,
             request_timeout=cfg.api_request_timeout,
+            trace_path=cfg.trace_path,
         )
 
         logger.info(

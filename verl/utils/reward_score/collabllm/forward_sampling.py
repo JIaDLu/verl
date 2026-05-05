@@ -108,6 +108,12 @@ def _simulator_step(
             json_mode=True,
             retries=config.api_retries,
             initial_backoff=config.api_initial_backoff,
+            tag="user_simulator",
+            meta={
+                "origin_id": entry.origin_id,
+                "branch_id": entry.branch_id,
+                "turn": entry.turn_count,
+            },
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
@@ -154,6 +160,12 @@ def _policy_step(
             json_mode=False,
             retries=config.api_retries,
             initial_backoff=config.api_initial_backoff,
+            tag="policy",
+            meta={
+                "origin_id": entry.origin_id,
+                "branch_id": entry.branch_id,
+                "turn": entry.turn_count,
+            },
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

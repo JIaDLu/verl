@@ -97,6 +97,8 @@ def score_accuracy(
             json_mode=True,
             retries=config.api_retries,
             initial_backoff=config.api_initial_backoff,
+            tag="accuracy_judge",
+            meta={"origin_id": entry.origin_id, "branch_id": entry.branch_id},
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("Accuracy judge failed: %s", e)
@@ -160,6 +162,8 @@ def score_interactivity(
             json_mode=True,
             retries=config.api_retries,
             initial_backoff=config.api_initial_backoff,
+            tag="interactivity_judge",
+            meta={"origin_id": entry.origin_id, "branch_id": entry.branch_id},
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("Interactivity judge failed: %s", e)
