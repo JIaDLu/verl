@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /Users/jiadong/project/My-AI-Project/verl/examples/grpo_trainer/start_reward_vllm.sh /Users/jiadong/project/My-AI-Project/verl/examples/grpo_trainer/run_collabllm_math.sh)"
+    ]
+  }
+}
