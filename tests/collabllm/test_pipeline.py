@@ -53,6 +53,9 @@ from verl.utils.reward_score.collabllm.llm_client import (  # noqa: E402
     LLMClient,
     resolve_api_key,
 )
+from verl.utils.reward_score.collabllm.policy_caller import (  # noqa: E402
+    HTTPPolicyCaller,
+)
 
 
 # ----------------------------------------------------------------------
@@ -93,7 +96,7 @@ def parse_args() -> argparse.Namespace:
                    help="forward sampling branches per response (small for testing)")
     p.add_argument("--window", type=int, default=2,
                    help="forward sampling turns window")
-    p.add_argument("--llm_api_base", default=os.environ.get("LLM_API_BASE", "https://api.deepseek.com/v1"))
+    p.add_argument("--llm_api_base", default=os.environ.get("LLM_API_BASE", "https://api.deepseek.com"))
     p.add_argument("--llm_api_key_env", default="DEEPSEEK_API_KEY")
     p.add_argument("--llm_model", default=os.environ.get("LLM_MODEL", "deepseek-v4-pro"))
     p.add_argument("--policy_api_base", default=os.environ.get("POLICY_API_BASE", "http://127.0.0.1:8000/v1"))
@@ -169,6 +172,19 @@ def run(args: argparse.Namespace) -> None:
         request_timeout=cfg.api_request_timeout, trace_path=cfg.trace_path,
     )
 
+    # Standalone test uses the HTTP-based PolicyCaller; production
+    # training uses GenFnPolicyCaller via the recipe trainer.
+    policy_caller = HTTPPolicyCaller(
+        client=policy_client,
+        model=cfg.policy_model,
+        temperature=cfg.policy_temperature,
+        max_tokens=cfg.policy_max_tokens,
+        top_p=cfg.policy_top_p,
+        retries=cfg.api_retries,
+        initial_backoff=cfg.api_initial_backoff,
+        max_workers=cfg.max_policy_workers,
+    )
+
     rollout_pairs = [(f["prompt_messages"], f["response_text"]) for f in FIXTURES]
     single_turn_prompts = [f["single_turn_prompt"] for f in FIXTURES]
     ground_truths = [f["ground_truth"] for f in FIXTURES]
@@ -182,7 +198,7 @@ def run(args: argparse.Namespace) -> None:
         ground_truths=ground_truths,
         config=cfg,
         sim_client=sim_client,
-        policy_client=policy_client,
+        policy_caller=policy_caller,
         judge_client=sim_client,  # same provider; same client
     )
 

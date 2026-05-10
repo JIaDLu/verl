@@ -3,7 +3,8 @@
     "allow": [
       "Bash(chmod +x /Users/jiadong/project/My-AI-Project/verl/examples/grpo_trainer/start_reward_vllm.sh /Users/jiadong/project/My-AI-Project/verl/examples/grpo_trainer/run_collabllm_math.sh)",
       "Bash(chmod +x /Users/jiadong/project/My-AI-Project/verl/tests/collabllm/test_pipeline.py)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m py_compile verl/utils/reward_score/collabllm/policy_caller.py verl/utils/reward_score/collabllm/forward_sampling.py verl/utils/reward_score/collabllm/llm_client.py verl/utils/reward_score/collabllm/config.py verl/utils/reward_score/collabllm/metrics.py verl/utils/reward_score/collabllm/trajectory.py verl/utils/reward_score/collabllm/prompts.py verl/experimental/reward_loop/reward_manager/collabllm.py recipes/collabllm/__init__.py recipes/collabllm/policy_generation.py recipes/collabllm/trainer.py recipes/collabllm/task_runner.py recipes/collabllm/main_collabllm_ppo.py tests/collabllm/test_pipeline.py)"
     ]
   }
 }

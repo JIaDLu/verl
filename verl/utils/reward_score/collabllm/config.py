@@ -45,7 +45,7 @@ class CollabLLMConfig:
     # ---------- LLM API for User Simulator + Judges ----------
     # Defaults target DeepSeek-v4-pro via its OpenAI-compatible endpoint;
     # override via reward_kwargs to switch providers.
-    llm_api_base: str = "https://api.deepseek.com/v1"
+    llm_api_base: str = "https://api.deepseek.com"
     llm_api_key_env: str = "DEEPSEEK_API_KEY"   # name of env var holding the key
     llm_model: str = "deepseek-v4-pro"
     user_simulator_temperature: float = 0.8

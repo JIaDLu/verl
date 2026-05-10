@@ -1,38 +1,31 @@
 #!/usr/bin/env bash
 # GRPO + CollabLLM multi-turn aware reward, on 2x RTX 4090 (48GB).
 #
-# Pipeline summary (one full step):
-#   rollout (vLLM, n=8) → forward sampling (calls reward vLLM + GPT-5.2)
-#       → MR scoring (per response) → GRPO advantage (group z-score, in verl)
-#       → ppo_epochs gradient updates → sync weights to vLLM → next step
+# Routes through the CollabLLM recipe entry point so forward sampling
+# uses the *live actor's vLLM* (zero checkpoint drift) — no side-car
+# vLLM server is required for production training.
+#
+# Pipeline (one full step):
+#   rollout (vLLM, n=8) → recompute log_prob (FSDP) → log_ref (FSDP)
+#       → reward [forward sampling via live actor + DeepSeek judges]
+#       → GRPO advantage (group z-score, in verl) → ppo_epochs updates
+#       → sync weights to vLLM → next step
 #
 # Hardware layout (GPUs 0 and 1, both 48GB):
-#   - actor FSDP shard:        ~6 GB / GPU
-#   - actor rollout vLLM:      ~12 GB / GPU  (gpu_memory_utilization=0.55)
-#   - ref policy (offloaded):  ~1 GB / GPU  (param_offload=True)
-#   - reward vLLM (GPU 1 only): ~12 GB        (started by start_reward_vllm.sh)
-#   - headroom + activations:  ~18 GB / GPU 0, ~6 GB / GPU 1
+#   - actor FSDP shard:       ~6 GB / GPU
+#   - actor rollout vLLM:     ~14 GB / GPU  (gpu_memory_utilization=0.65)
+#   - ref policy (offloaded): ~1 GB / GPU
+#   - headroom:               ~25 GB / GPU
 #
-# Architectural caveat (read once):
-#   The "reward vLLM" started on the side serves a *frozen* SFT-merged
-#   checkpoint, not the live actor. CollabLLM's spec asks for the live
-#   policy in forward sampling; however, exposing the actor's in-process
-#   vLLM as an HTTP endpoint to a separate reward worker is invasive.
-#   Using the SFT-merged checkpoint is a principled approximation:
-#     - At step 0 the two are identical.
-#     - Over training they diverge slowly because LR is small and KL
-#       penalty bounds drift.
-#   For 2000 prompts × moderate epochs, this is acceptable. To upgrade:
-#   replace the reward vLLM with an injected ``generation_fn`` callback
-#   wired to ``actor_rollout_wg.generate_sequences()`` from the trainer.
+# Prereqs:
+#   1. SFT-merged checkpoint at SFT_MERGED_PATH.
+#   2. DEEPSEEK_API_KEY exported.
+#   3. wandb logged in.
 #
-# Prereqs (run once before this script):
-#   1. SFT-merged checkpoint exists at SFT_MERGED_PATH.
-#   2. Reward vLLM is running:
-#        bash examples/grpo_trainer/start_reward_vllm.sh
-#      Verify: curl http://127.0.0.1:8000/v1/models
-#   3. DEEPSEEK_API_KEY is exported (used by User Simulator + Judges).
-#   4. wandb is logged in.
+# NOT required for production:
+#   - The side-car reward vLLM (start_reward_vllm.sh). That script is
+#     now only used by tests/collabllm/test_pipeline.py for offline
+#     pipeline validation.
 #
 # Launch:
 #   bash examples/grpo_trainer/run_collabllm_math.sh
@@ -51,19 +44,11 @@ PROJECT_NAME=${PROJECT_NAME:-collabllm}
 EXP_NAME=${EXP_NAME:-collabllm_grpo_math_$(date +%Y%m%d_%H%M%S)}
 WANDB_ENTITY=${WANDB_ENTITY:-lujiadong-nus}
 
-# ---------- reward-side endpoints ----------
-REWARD_POLICY_BASE=${REWARD_POLICY_BASE:-http://127.0.0.1:8000/v1}
-REWARD_POLICY_NAME=${REWARD_POLICY_NAME:-collabllm-policy}
-LLM_API_BASE=${LLM_API_BASE:-https://api.deepseek.com/v1}
+# ---------- LLM judge / user simulator (DeepSeek) ----------
+LLM_API_BASE=${LLM_API_BASE:-https://api.deepseek.com}
 LLM_API_KEY_ENV=${LLM_API_KEY_ENV:-DEEPSEEK_API_KEY}
-LLM_MODEL=${LLM_MODEL:-deepseek-v4-pro}
+LLM_MODEL=${LLM_MODEL:-deepseek-v4-flash}
 
-# Sanity check: reward vLLM up?
-if ! curl -sf "${REWARD_POLICY_BASE/\/v1/}/v1/models" > /dev/null 2>&1; then
-    echo "ERROR: reward vLLM not reachable at ${REWARD_POLICY_BASE}"
-    echo "Start it first: bash examples/grpo_trainer/start_reward_vllm.sh"
-    exit 1
-fi
 if [ -z "${!LLM_API_KEY_ENV:-}" ]; then
     echo "ERROR: ${LLM_API_KEY_ENV} env var is empty. Export it before launching."
     exit 1
@@ -72,7 +57,7 @@ fi
 # ---------- main launch ----------
 WANDB_ENTITY=${WANDB_ENTITY} \
 CUDA_VISIBLE_DEVICES=0,1 \
-python -m verl.trainer.main_ppo \
+python -m recipes.collabllm.main_collabllm_ppo \
     \
     `# --- algorithm ---` \
     algorithm.adv_estimator=grpo \
@@ -100,11 +85,11 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     \
-    `# --- rollout (vLLM, n=8 for GRPO group) ---` \
+    `# --- rollout (vLLM, n=8 GRPO group; same vLLM also serves forward sampling) ---` \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=0.95 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
@@ -115,7 +100,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     \
-    `# --- reward manager (CollabLLM) ---` \
+    `# --- reward manager (CollabLLM, inline dispatch) ---` \
     reward.reward_manager.source=register \
     reward.reward_manager.name=collabllm \
     +reward.reward_kwargs.forward_sampling_window=2 \
@@ -131,15 +116,8 @@ python -m verl.trainer.main_ppo \
     +reward.reward_kwargs.llm_model="${LLM_MODEL}" \
     +reward.reward_kwargs.user_simulator_temperature=0.8 \
     +reward.reward_kwargs.judge_temperature=0.0 \
-    +reward.reward_kwargs.policy_api_base="${REWARD_POLICY_BASE}" \
-    +reward.reward_kwargs.policy_api_key=EMPTY \
-    +reward.reward_kwargs.policy_model="${REWARD_POLICY_NAME}" \
-    +reward.reward_kwargs.policy_temperature=1.0 \
-    +reward.reward_kwargs.policy_top_p=0.95 \
-    +reward.reward_kwargs.policy_max_tokens=512 \
     +reward.reward_kwargs.max_metric_workers=64 \
     +reward.reward_kwargs.max_simulator_workers=64 \
-    +reward.reward_kwargs.max_policy_workers=64 \
     +reward.reward_kwargs.api_retries=3 \
     +reward.reward_kwargs.api_initial_backoff=1.0 \
     +reward.reward_kwargs.api_request_timeout=60.0 \

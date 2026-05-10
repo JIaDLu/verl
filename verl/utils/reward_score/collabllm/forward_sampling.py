@@ -13,23 +13,25 @@
 # limitations under the License.
 """Forward-sampling pool + simulation loop + metric aggregation.
 
-This is the core of CollabLLM's multi-turn aware reward.
+Core of CollabLLM's multi-turn aware reward.
 
-  1. From N rollout responses, build N*B trajectory entries
-     (B = ``config.forward_sampling_branches``).
-  2. Repeat for at most ``config.forward_sampling_window`` turns:
-       a. Drop entries that have hit the window cap.
+  1. From N rollout responses, build N*B trajectory entries.
+  2. Repeat for at most ``window`` turns:
+       a. Drop entries that hit the window cap.
        b. Parallel User-Simulator round on every active entry.
-          Append user reply, or terminate on terminal signal.
-       c. Parallel Policy round on still-active entries.
-          Append assistant reply; bump turn count; terminate on
-          empty output or seq-len overflow.
+          (Per-entry threaded — each entry has different STP context.)
+       c. *Batched* Policy round on still-active entries.
+          (One ``policy_caller.generate_batch`` call covers everyone.)
   3. Score every trajectory on every metric in parallel.
-  4. Aggregate metric scores into ``r_star`` (weighted sum) per branch,
-     then average sibling branches into per-response MR.
+  4. Aggregate metric scores into r_star (weighted sum) per branch,
+     then average branches into per-response MR.
 
-Three independent ThreadPools (simulator / policy / metrics) keep
-different rate-limit budgets from interfering.
+The Policy round is round-level batched. This is what enables the
+trainer-injected ``GenFnPolicyCaller`` to use the live actor's vLLM
+efficiently — all active conversations across the whole batch are
+fanned into a single ``actor_rollout_wg.generate_sequences`` call per
+turn. The HTTP fallback uses the same interface and fans out internally
+via ThreadPool.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .config import CollabLLMConfig
 from .llm_client import LLMClient
 from .metrics import _get_encoding, score_one
+from .policy_caller import PolicyCaller
 from .prompts import render_user_simulator_prompt, safe_parse_json
 from .trajectory import (
     TERMINAL_POLICY_ERROR,
@@ -83,7 +86,7 @@ def init_pool(
 
 
 # ----------------------------------------------------------------------
-# Per-entry steps (run inside thread pools)
+# User-simulator step (per-entry, threaded — each has a different STP)
 # ----------------------------------------------------------------------
 def _simulator_step(
     entry: TrajectoryEntry,
@@ -127,7 +130,6 @@ def _simulator_step(
     if isinstance(parsed, dict) and "response" in parsed:
         user_reply = str(parsed["response"]).strip()
     else:
-        # Salvage raw text — better noisy signal than zero signal.
         user_reply = (raw or "").strip()
         if not user_reply:
             entry.stop(TERMINAL_SIMULATOR_ERROR)
@@ -143,90 +145,18 @@ def _simulator_step(
     entry.append("user", user_reply)
 
 
-def _policy_step(
-    entry: TrajectoryEntry,
-    *,
-    config: CollabLLMConfig,
-    policy_client: LLMClient,
-) -> None:
-    """One policy-model (vLLM) turn on one entry. Mutates ``entry`` in place."""
-    try:
-        reply = policy_client.chat(
-            messages=entry.conversation,
-            model=config.policy_model,
-            temperature=config.policy_temperature,
-            max_tokens=config.policy_max_tokens,
-            top_p=config.policy_top_p,
-            json_mode=False,
-            retries=config.api_retries,
-            initial_backoff=config.api_initial_backoff,
-            tag="policy",
-            meta={
-                "origin_id": entry.origin_id,
-                "branch_id": entry.branch_id,
-                "turn": entry.turn_count,
-            },
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "Policy call failed (origin=%d, branch=%d): %s",
-            entry.origin_id, entry.branch_id, e,
-        )
-        entry.stop(TERMINAL_POLICY_ERROR)
-        return
-
-    if not reply or not reply.strip():
-        entry.stop(TERMINAL_POLICY_ERROR)
-        return
-
-    entry.append("assistant", reply.strip())
-    entry.turn_count += 1
-
-    # Token-budget guard. Approximate using assistant + user content;
-    # we care about order of magnitude, not exact prompt accounting.
-    enc = _get_encoding(config.tiktoken_encoding)
-    total = sum(len(enc.encode(m.get("content", ""))) for m in entry.conversation)
-    if total >= config.max_seq_len:
-        entry.stop(TERMINAL_TOKEN_BUDGET)
-
-
-# ----------------------------------------------------------------------
-# Pool-wide simulation loop
-# ----------------------------------------------------------------------
-def _run_pool_round(
+def _run_simulator_round(
     active: list[TrajectoryEntry],
-    step_fn,
-    *,
-    max_workers: int,
-    on_error: str,
-) -> None:
-    """Submit ``step_fn(entry)`` for every active entry, in parallel."""
-    if not active:
-        return
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(step_fn, e): e for e in active}
-        for fut in as_completed(futs):
-            try:
-                fut.result()
-            except Exception as exc:  # noqa: BLE001
-                entry = futs[fut]
-                logger.error(
-                    "Round step crashed (origin=%d branch=%d): %s",
-                    entry.origin_id, entry.branch_id, exc,
-                )
-                entry.stop(on_error)
-
-
-def _simulate(
-    pool: list[TrajectoryEntry],
     *,
     stp_by_origin: list[str],
     config: CollabLLMConfig,
     sim_client: LLMClient,
-    policy_client: LLMClient,
 ) -> None:
-    """Advance the whole pool up to the window cap."""
-    def sim_step(e: TrajectoryEntry) -> None:
+    """One simulator round across all active entries, in parallel threads."""
+    if not active:
+        return
+
+    def step(e: TrajectoryEntry) -> None:
         _simulator_step(
             e,
             single_turn_prompt=stp_by_origin[e.origin_id],
@@ -234,11 +164,79 @@ def _simulate(
             sim_client=sim_client,
         )
 
-    def pol_step(e: TrajectoryEntry) -> None:
-        _policy_step(e, config=config, policy_client=policy_client)
+    with ThreadPoolExecutor(max_workers=config.max_simulator_workers) as ex:
+        futs = {ex.submit(step, e): e for e in active}
+        for fut in as_completed(futs):
+            try:
+                fut.result()
+            except Exception as e:  # noqa: BLE001
+                entry = futs[fut]
+                logger.error(
+                    "Simulator round crashed (origin=%d branch=%d): %s",
+                    entry.origin_id, entry.branch_id, e,
+                )
+                entry.stop(TERMINAL_SIMULATOR_ERROR)
 
-    # Window+1 outer iterations is intentional: it lets the user
-    # simulator have the *last* word after the policy's window-th turn.
+
+# ----------------------------------------------------------------------
+# Policy round (batched at round level)
+# ----------------------------------------------------------------------
+def _run_policy_round(
+    active: list[TrajectoryEntry],
+    *,
+    config: CollabLLMConfig,
+    policy_caller: PolicyCaller,
+) -> None:
+    """One policy round across all active entries, *batched* through PolicyCaller.
+
+    All active conversations are submitted in a single
+    ``policy_caller.generate_batch`` call. The caller is responsible for
+    its own concurrency (HTTP fan-out / vLLM batching).
+    """
+    if not active:
+        return
+
+    convs = [e.conversation for e in active]
+    metas = [
+        {
+            "origin_id": e.origin_id,
+            "branch_id": e.branch_id,
+            "turn": e.turn_count,
+        }
+        for e in active
+    ]
+    replies = policy_caller.generate_batch(convs, meta_batch=metas)
+
+    enc = _get_encoding(config.tiktoken_encoding)
+    for entry, reply in zip(active, replies):
+        if not reply or not reply.strip():
+            entry.stop(TERMINAL_POLICY_ERROR)
+            continue
+        entry.append("assistant", reply.strip())
+        entry.turn_count += 1
+        # Token-budget guard. Approximate using assistant + user content.
+        total = sum(len(enc.encode(m.get("content", ""))) for m in entry.conversation)
+        if total >= config.max_seq_len:
+            entry.stop(TERMINAL_TOKEN_BUDGET)
+
+
+# ----------------------------------------------------------------------
+# Whole-pool simulation
+# ----------------------------------------------------------------------
+def _simulate(
+    pool: list[TrajectoryEntry],
+    *,
+    stp_by_origin: list[str],
+    config: CollabLLMConfig,
+    sim_client: LLMClient,
+    policy_caller: PolicyCaller,
+) -> None:
+    """Advance the whole pool up to the window cap.
+
+    Window+1 outer iterations is intentional: it lets the user simulator
+    have the *last* word after the policy's window-th turn (so the
+    trajectory ends with a user message, mimicking real conversation).
+    """
     for _ in range(config.forward_sampling_window + 1):
         for e in pool:
             if e.is_active and e.turn_count >= config.forward_sampling_window:
@@ -247,16 +245,13 @@ def _simulate(
         active = [e for e in pool if e.is_active]
         if not active:
             return
-        _run_pool_round(active, sim_step,
-                        max_workers=config.max_simulator_workers,
-                        on_error=TERMINAL_SIMULATOR_ERROR)
+        _run_simulator_round(active, stp_by_origin=stp_by_origin,
+                             config=config, sim_client=sim_client)
 
         active = [e for e in pool if e.is_active]
         if not active:
             return
-        _run_pool_round(active, pol_step,
-                        max_workers=config.max_policy_workers,
-                        on_error=TERMINAL_POLICY_ERROR)
+        _run_policy_round(active, config=config, policy_caller=policy_caller)
 
 
 # ----------------------------------------------------------------------
@@ -315,26 +310,24 @@ def compute_multiturn_rewards(
     ground_truths: list[str],
     config: CollabLLMConfig,
     sim_client: LLMClient,
-    policy_client: LLMClient,
+    policy_caller: PolicyCaller,
     judge_client: LLMClient,
 ) -> tuple[list[float], list[dict]]:
     """Run the full pipeline and return MR per rollout pair.
 
     Args:
         rollout_pairs: N pairs of (prompt history, response text).
-        single_turn_prompts: per-pair original full question. Used by
-            the user simulator (as hidden goal) and the accuracy judge.
+        single_turn_prompts: per-pair original full question.
         ground_truths: per-pair reference answer.
         config: tuning knobs.
-        sim_client / policy_client / judge_client: pre-built LLM clients
-            (may be the same object if base_url + api_key match).
+        sim_client / judge_client: chat clients for User Simulator and
+            LLM Judges (typically the same provider/object).
+        policy_caller: abstraction over the policy turn — either an
+            ``HTTPPolicyCaller`` (test path) or a ``GenFnPolicyCaller``
+            wrapping the trainer's live actor (production path).
 
     Returns:
-        (mr_values, debug_info) where:
-          - mr_values: list of N floats, one per rollout pair (mean
-            r_star across branches).
-          - debug_info: per-response diagnostic dicts — branch r_star,
-            terminal reasons, per-metric averages.
+        (mr_values, debug_info) — N MR floats and per-response diagnostic dicts.
     """
     n = len(rollout_pairs)
     if not (len(single_turn_prompts) == n == len(ground_truths)):
@@ -351,7 +344,7 @@ def compute_multiturn_rewards(
         stp_by_origin=list(single_turn_prompts),
         config=config,
         sim_client=sim_client,
-        policy_client=policy_client,
+        policy_caller=policy_caller,
     )
 
     _score(
