@@ -65,7 +65,7 @@ python -m recipes.collabllm.main_collabllm_ppo \
     \
     `# --- data ---` \
     data.train_files="${TRAIN_PARQUET}" \
-    data.val_files=null \
+    data.val_files="${TRAIN_PARQUET}" \
     data.train_batch_size=64 \
     data.max_prompt_length=2048 \
     data.max_response_length=1024 \
