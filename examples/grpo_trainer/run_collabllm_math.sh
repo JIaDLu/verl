@@ -132,7 +132,7 @@ python -m recipes.collabllm.main_collabllm_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=-1 \
     trainer.total_epochs=4 \
-    trainer.max_ckpt_to_keep=3 \
+    +trainer.max_ckpt_to_keep=3 \
     trainer.resume_mode=auto \
     \
     2>&1 | tee "${LOG_DIR}/${EXP_NAME}.log"
